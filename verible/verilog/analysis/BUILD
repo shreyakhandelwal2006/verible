@@ -66,6 +66,31 @@ cc_test(
 )
 
 cc_library(
+    name = "module-hierarchy",
+    srcs = ["module-hierarchy.cc"],
+    hdrs = ["module-hierarchy.h"],
+    deps = [
+        "//verible/common/text:concrete-syntax-leaf",
+        "//verible/common/text:symbol",
+        "//verible/common/text:tree-utils",
+        "//verible/verilog/CST:declaration",
+        "//verible/verilog/CST:module",
+    ],
+)
+
+cc_test(
+    name = "module-hierarchy_test",
+    srcs = ["module-hierarchy_test.cc"],
+    deps = [
+        ":module-hierarchy",
+        ":verilog-analyzer",
+        "//verible/verilog/preprocessor:verilog-preprocess",
+        "@googletest//:gtest",
+        "@googletest//:gtest_main",
+    ],
+)
+
+cc_library(
     name = "json-diagnostics",
     srcs = ["json-diagnostics.cc"],
     hdrs = ["json-diagnostics.h"],
