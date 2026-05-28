@@ -71,10 +71,12 @@ cc_library(
     hdrs = ["module-hierarchy.h"],
     deps = [
         "//verible/common/text:concrete-syntax-leaf",
+        "//verible/common/text:concrete-syntax-tree",
         "//verible/common/text:symbol",
         "//verible/common/text:tree-utils",
         "//verible/verilog/CST:declaration",
         "//verible/verilog/CST:module",
+        "//verible/verilog/CST:verilog-nonterminals",
     ],
 )
 

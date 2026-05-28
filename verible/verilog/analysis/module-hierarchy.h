@@ -3,13 +3,12 @@
 //
 // Scope of this pass:
 //  * single-file extraction only
-//  * direct (non-generate-block) module instantiations only
+//  * direct (non-generate-block) module/interface instantiations only
 //  * no cross-file resolution, no parameter specialisation
 
 #ifndef VERIBLE_VERILOG_ANALYSIS_MODULE_HIERARCHY_H_
 #define VERIBLE_VERILOG_ANALYSIS_MODULE_HIERARCHY_H_
 
-#include <map>
 #include <string>
 #include <vector>
 
@@ -18,20 +17,30 @@
 namespace verilog {
 namespace analysis {
 
-// Maps a module name to the (possibly-duplicated) list of module type names
-// that are instantiated directly inside it.
-//
-// The map key is the declaring module name.
-// Each entry in the value vector is the type name of one instantiation
-// (i.e. the module being instantiated, not the instance label).
-//
-// Modules with no instantiations still appear as keys with an empty vector,
-// provided they have a parseable name.
-using ModuleHierarchyMap = std::map<std::string, std::vector<std::string>>;
+// A single node in the instantiation hierarchy tree.
+// Each node represents one module/interface instantiation, or a top-level
+// module/interface (in which case instance_name is empty).
+struct InstanceNode {
+  std::string instance_name;  // e.g. "u_cpu", empty for a top-level root
+  std::string module_type;    // e.g. "cpu"
+  std::vector<InstanceNode> children;
+};
 
-// Build the parent->child hierarchy from a parsed CST root.
-// Returns a ModuleHierarchyMap as described above.
-ModuleHierarchyMap BuildModuleHierarchy(const verible::Symbol &root);
+// Build a forest of instance hierarchy trees from a parsed CST root.
+//
+// Each tree root corresponds to a top-level module or interface (i.e. one
+// that is not instantiated by any other module/interface in the same file).
+// Children are recursively expanded using the per-module instantiation
+// information.
+//
+// Both module declarations and interface declarations are discovered.
+//
+// Instance names, module/interface types, and parent-child hierarchy
+// relationships are all preserved.
+std::vector<InstanceNode> BuildInstanceForest(const verible::Symbol &root);
+
+// Pretty-print a hierarchy forest as an indented tree.
+std::string PrintHierarchyTree(const std::vector<InstanceNode> &forest);
 
 }  // namespace analysis
 }  // namespace verilog
