@@ -6,11 +6,18 @@
 //   verible-verilog-hierarchy <file> [<file>...]
 //
 // Produces a tree view of the instance hierarchy.
+//
+// Multi-file strategy (global-map approach):
+//   1. Parse each file and call CollectDeclarations() to extract raw maps.
+//   2. Merge all per-file maps into a single global set of maps.
+//   3. Call BuildInstanceForestFromMaps() once on the merged maps.
+//
+// This ensures that cross-file references, parameter overrides, and
+// declaration kinds are all resolved correctly.
 
-#include <functional>
 #include <iostream>
 #include <map>
-#include <set>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -25,126 +32,12 @@
 #include "verible/verilog/preprocessor/verilog-preprocess.h"
 
 using verilog::VerilogAnalyzer;
-using verilog::analysis::BuildInstanceForest;
-using verilog::analysis::InstanceNode;
+using verilog::analysis::BuildInstanceForestFromMaps;
+using verilog::analysis::CollectDeclarations;
+using verilog::analysis::DeclarationKind;
+using verilog::analysis::FileDeclarations;
+using verilog::analysis::InstantiationRecord;
 using verilog::analysis::PrintHierarchyTree;
-
-// Build the combined forest from multiple files.
-// Each file is parsed independently; per-file module/interface instantiation
-// data is merged into a combined map, then a combined forest is built.
-static std::vector<InstanceNode> BuildCombinedForest(
-    const std::vector<std::string> &filenames,
-    const verilog::VerilogPreprocess::Config &preprocess_config,
-    int *exit_status) {
-  // Combined map: declaration_name -> list of {instance_name, type_name}
-  struct InstInfo {
-    std::string instance_name;
-    std::string type_name;
-  };
-  std::map<std::string, std::vector<InstInfo>> combined_map;
-  std::vector<std::string> all_modules;  // preserve order
-
-  for (const auto &filename : filenames) {
-    auto content_status = verible::file::GetContentAsMemBlock(filename);
-    if (!content_status.status().ok()) {
-      std::cerr << content_status.status().message() << std::endl;
-      *exit_status = 1;
-      continue;
-    }
-    std::shared_ptr<verible::MemBlock> content = std::move(*content_status);
-
-    auto analyzer = VerilogAnalyzer::AnalyzeAutomaticMode(
-        content, filename, preprocess_config);
-    if (analyzer == nullptr) {
-      std::cerr << filename << ": analysis failed" << std::endl;
-      *exit_status = 1;
-      continue;
-    }
-    if (!analyzer->LexStatus().ok()) {
-      std::cerr << filename << ": lex error: "
-                << analyzer->LexStatus().message() << std::endl;
-      *exit_status = 1;
-      continue;
-    }
-    if (!analyzer->ParseStatus().ok()) {
-      std::cerr << filename << ": parse error: "
-                << analyzer->ParseStatus().message() << std::endl;
-      *exit_status = 1;
-      continue;
-    }
-
-    const auto &tree = analyzer->SyntaxTree();
-    if (tree == nullptr) continue;
-
-    // Build per-file forest (now includes both modules and interfaces).
-    auto forest = BuildInstanceForest(*tree);
-
-    // Walk per-file forest to merge instantiation data into combined map.
-    std::function<void(const InstanceNode &)> collect =
-        [&](const InstanceNode &node) {
-          auto &insts = combined_map[node.module_type];
-          for (const auto &child : node.children) {
-            insts.push_back({child.instance_name, child.module_type});
-          }
-          for (const auto &child : node.children) {
-            collect(child);
-          }
-        };
-
-    for (const auto &root : forest) {
-      if (combined_map.find(root.module_type) == combined_map.end()) {
-        all_modules.push_back(root.module_type);
-      }
-      collect(root);
-    }
-  }
-
-  // Identify top-level modules/interfaces.
-  std::set<std::string> instantiated_types;
-  for (const auto &[name, instances] : combined_map) {
-    for (const auto &inst : instances) {
-      instantiated_types.insert(inst.type_name);
-    }
-  }
-
-  std::vector<std::string> top_level;
-  for (const auto &mod : all_modules) {
-    if (instantiated_types.count(mod) == 0) {
-      top_level.push_back(mod);
-    }
-  }
-  if (top_level.empty()) {
-    top_level = all_modules;
-  }
-
-  // Build combined trees with cycle detection.
-  std::function<InstanceNode(const std::string &, const std::string &,
-                              std::set<std::string> *)>
-      build_node = [&](const std::string &inst_name,
-                       const std::string &mod_type,
-                       std::set<std::string> *visited) -> InstanceNode {
-    InstanceNode node;
-    node.instance_name = inst_name;
-    node.module_type = mod_type;
-    if (visited->count(mod_type)) return node;
-    auto it = combined_map.find(mod_type);
-    if (it == combined_map.end()) return node;
-    visited->insert(mod_type);
-    for (const auto &inst : it->second) {
-      node.children.push_back(
-          build_node(inst.instance_name, inst.type_name, visited));
-    }
-    visited->erase(mod_type);
-    return node;
-  };
-
-  std::vector<InstanceNode> forest;
-  for (const auto &mod : top_level) {
-    std::set<std::string> visited;
-    forest.push_back(build_node("", mod, &visited));
-  }
-  return forest;
-}
 
 int main(int argc, char **argv) {
   const auto usage = absl::StrCat(
@@ -170,10 +63,108 @@ int main(int argc, char **argv) {
     filenames.emplace_back(*it);
   }
 
-  // Build combined forest from all input files and print.
-  auto forest =
-      BuildCombinedForest(filenames, preprocess_config, &exit_status);
-  std::cout << PrintHierarchyTree(forest);
+  // Phase 1: Parse each file and collect raw declaration data.
+  // Keep analyzers alive so that CST node pointers in decl_map remain valid.
+  std::vector<std::unique_ptr<VerilogAnalyzer>> analyzers;
+  std::vector<FileDeclarations> per_file_decls;
+
+  for (const auto &filename : filenames) {
+    auto content_status = verible::file::GetContentAsMemBlock(filename);
+    if (!content_status.status().ok()) {
+      std::cerr << content_status.status().message() << std::endl;
+      exit_status = 1;
+      continue;
+    }
+    std::shared_ptr<verible::MemBlock> content = std::move(*content_status);
+
+    auto analyzer = VerilogAnalyzer::AnalyzeAutomaticMode(
+        content, filename, preprocess_config);
+    if (analyzer == nullptr) {
+      std::cerr << filename << ": analysis failed" << std::endl;
+      exit_status = 1;
+      continue;
+    }
+    if (!analyzer->LexStatus().ok()) {
+      std::cerr << filename << ": lex error: "
+                << analyzer->LexStatus().message() << std::endl;
+      exit_status = 1;
+      continue;
+    }
+    if (!analyzer->ParseStatus().ok()) {
+      std::cerr << filename << ": parse error: "
+                << analyzer->ParseStatus().message() << std::endl;
+      exit_status = 1;
+      continue;
+    }
+
+    const auto &tree = analyzer->SyntaxTree();
+    if (tree == nullptr) {
+      analyzers.push_back(std::move(analyzer));
+      continue;
+    }
+
+    // Collect raw declaration data from this file.
+    FileDeclarations decls = CollectDeclarations(*tree);
+
+    // Emit per-file collection errors (e.g. intra-file duplicates).
+    for (const auto &err : decls.errors) {
+      std::cerr << filename << ": " << err << std::endl;
+      exit_status = 1;
+    }
+
+    per_file_decls.push_back(std::move(decls));
+
+    // Keep analyzer alive — decl_map pointers reference its CST.
+    analyzers.push_back(std::move(analyzer));
+  }
+
+  // Phase 2: Merge per-file maps into global maps.
+  std::map<std::string, std::vector<InstantiationRecord>> global_module_map;
+  std::map<std::string, DeclarationKind> global_kind_map;
+  std::map<std::string, const verible::Symbol *> global_decl_map;
+  std::vector<std::string> global_all_modules;
+
+  for (const auto &decls : per_file_decls) {
+    for (const auto &name : decls.all_modules) {
+      // Check for cross-file duplicate declarations.
+      if (global_module_map.count(name)) {
+        std::cerr << "error: multiple declarations of module/interface '"
+                  << name << "'" << std::endl;
+        exit_status = 1;
+        continue;
+      }
+
+      auto it = decls.module_map.find(name);
+      if (it != decls.module_map.end()) {
+        global_module_map[name] = it->second;
+      }
+
+      auto kind_it = decls.kind_map.find(name);
+      if (kind_it != decls.kind_map.end()) {
+        global_kind_map[name] = kind_it->second;
+      }
+
+      auto decl_it = decls.decl_map.find(name);
+      if (decl_it != decls.decl_map.end()) {
+        global_decl_map[name] = decl_it->second;
+      }
+
+      global_all_modules.push_back(name);
+    }
+  }
+
+  // Phase 3: Build the combined forest from the global maps.
+  auto result = BuildInstanceForestFromMaps(
+      global_module_map, global_kind_map, global_decl_map, global_all_modules);
+
+  // Emit build errors (undeclared modules, etc.).
+  for (const auto &err : result.errors) {
+    std::cerr << err << std::endl;
+    exit_status = 1;
+  }
+
+  // Phase 4: Print the hierarchy.
+  std::cout << PrintHierarchyTree(result.forest);
 
   return exit_status;
 }

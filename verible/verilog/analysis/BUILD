@@ -76,6 +76,7 @@ cc_library(
         "//verible/common/text:tree-utils",
         "//verible/verilog/CST:declaration",
         "//verible/verilog/CST:module",
+        "//verible/verilog/CST:parameters",
         "//verible/verilog/CST:verilog-nonterminals",
     ],
 )
